@@ -1,5 +1,4 @@
 flask
-FinanceDataReader
 yfinance
 pandas
 gunicorn
