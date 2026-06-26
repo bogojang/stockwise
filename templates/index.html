@@ -239,9 +239,8 @@
   <div id="control-bar" class="hidden mb-4 flex flex-wrap items-center gap-2">
     <!-- 등급 필터 -->
     <div class="flex gap-1 bg-slate-900 border border-slate-800 rounded-xl p-1">
-      <button class="filter-btn active text-xs px-3 py-1.5 rounded-lg bg-slate-700 text-white" data-filter="BUY">🟢 매수만</button>
-      <button class="filter-btn text-xs px-3 py-1.5 rounded-lg text-slate-400 hover:text-white" data-filter="BUY,HOLD">🟢🔵 매수+보유</button>
-      <button class="filter-btn text-xs px-3 py-1.5 rounded-lg text-slate-400 hover:text-white" data-filter="ALL">전체</button>
+      <button class="filter-btn active text-xs px-3 py-1.5 rounded-lg bg-slate-700 text-white" data-filter="BUY,HOLD">🟢🔵 매수+보유</button>
+      <button class="filter-btn text-xs px-3 py-1.5 rounded-lg text-slate-400 hover:text-white" data-filter="ALL">전체 보기</button>
     </div>
     <div class="h-4 w-px bg-slate-700"></div>
     <!-- 정렬 -->
@@ -288,7 +287,7 @@
 // ── 상태 ──────────────────────────────────────────────────────────────────────
 let currentMarket = 'KOSPI';
 let allStocks     = [];
-let filterGrade   = 'BUY';
+let filterGrade   = 'BUY,HOLD';
 let filterTheme   = 'ALL';
 let sortMode      = 'score';
 let searchQuery   = '';

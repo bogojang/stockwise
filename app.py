@@ -406,14 +406,56 @@ _KOSDAQ_RAW = [
 ]
 
 
-def get_listing(market: str) -> list[dict]:
+def _listing_from_pykrx(market: str) -> list[dict]:
+    """KRX에서 실시간 시총 상위 종목 목록 가져오기"""
+    from pykrx import stock as pykrx_stock
+
+    today = datetime.now()
+    # 주말이면 직전 금요일로
+    while today.weekday() >= 5:
+        today -= timedelta(days=1)
+    date_str = today.strftime('%Y%m%d')
+
+    limit = 80 if market == 'KOSPI' else 60
     suffix = '.KS' if market == 'KOSPI' else '.KQ'
-    raw = _KOSPI_RAW if market == 'KOSPI' else _KOSDAQ_RAW
-    return [
-        {'ticker': f"{code}{suffix}", 'kr_code': code,
-         'name': name, 'sector': sector, 'industry': industry}
-        for code, name, sector, industry in raw
-    ]
+
+    df = pykrx_stock.get_market_cap_by_ticker(date_str, market=market)
+    if df is None or df.empty:
+        raise ValueError('pykrx 데이터 없음')
+
+    df = df.sort_values('시가총액', ascending=False).head(limit)
+
+    result = []
+    for ticker in df.index:
+        try:
+            name = pykrx_stock.get_market_ticker_name(ticker)
+        except Exception:
+            name = ticker
+        result.append({
+            'ticker':   f"{ticker}{suffix}",
+            'kr_code':  ticker,
+            'name':     name,
+            'sector':   '-',
+            'industry': '-',
+        })
+    return result
+
+
+def get_listing(market: str) -> list[dict]:
+    """pykrx(실시간) → 실패 시 하드코딩 폴백"""
+    try:
+        result = _listing_from_pykrx(market)
+        logger.info(f"[pykrx] {market} {len(result)}개 로드")
+        return result
+    except Exception as e:
+        logger.warning(f"[pykrx 실패, 폴백 사용] {e}")
+        suffix = '.KS' if market == 'KOSPI' else '.KQ'
+        raw = _KOSPI_RAW if market == 'KOSPI' else _KOSDAQ_RAW
+        return [
+            {'ticker': f"{code}{suffix}", 'kr_code': code,
+             'name': name, 'sector': sector, 'industry': industry}
+            for code, name, sector, industry in raw
+        ]
 
 
 # ── 종목 결과 조립 ────────────────────────────────────────────────────────────
