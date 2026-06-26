@@ -1,3 +1,4 @@
+from __future__ import annotations  # Python 3.9 호환 타입 힌트
 from flask import Flask, jsonify, render_template, request, Response, stream_with_context
 import FinanceDataReader as fdr
 import yfinance as yf
