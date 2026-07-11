@@ -1,17 +1,22 @@
 from __future__ import annotations
 from flask import Flask, jsonify, render_template, request, Response, stream_with_context
+from dotenv import load_dotenv
 import yfinance as yf
 import pandas as pd
 import json
+import os
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import logging
 from datetime import datetime, timedelta
 
+load_dotenv()
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+DART_API_KEY = os.getenv('DART_API_KEY', '').strip()
 
 # ── 캐시 ─────────────────────────────────────────────────────────────────────
 _cache: dict = {}
@@ -179,72 +184,144 @@ def consecutive_growth(values: list) -> int:
 
 
 # ── 시그널 생성 ───────────────────────────────────────────────────────────────
+def consecutive_decline(values: list) -> int:
+    """오래된→최신 순 리스트에서 연속 감소 연수 반환"""
+    valid = [v for v in values if v is not None]
+    if len(valid) < 2:
+        return 0
+    count = 0
+    for i in range(len(valid) - 1, 0, -1):
+        if valid[i] < valid[i - 1]:
+            count += 1
+        else:
+            break
+    return count
+
+
 def generate_signals(data: dict, sector_avg: dict = None) -> list:
-    signals = []
+    pos_signals, warn_signals = [], []
     trend = data.get('financial_trend') or {}
+    revenues  = trend.get('revenues', [])
+    op_profits = trend.get('op_profits', [])
 
-    # 매출액 연속 증가
-    rev_cons = consecutive_growth(trend.get('revenues', []))
+    # ── 긍정 시그널 ──────────────────────────────────────────────────────────
+    rev_cons = consecutive_growth(revenues)
     if rev_cons >= 3:
-        signals.append({'type': 'pos', 'icon': '📈', 'text': f'최근 {rev_cons}년 연속 매출액 증가'})
+        pos_signals.append({'type': 'pos', 'icon': '📈', 'text': f'최근 {rev_cons}년 연속 매출액 증가'})
     elif rev_cons == 2:
-        signals.append({'type': 'pos', 'icon': '📈', 'text': '최근 2년 연속 매출액 증가'})
+        pos_signals.append({'type': 'pos', 'icon': '📈', 'text': '최근 2년 연속 매출액 증가'})
 
-    # 영업이익 연속 증가
-    op_cons = consecutive_growth(trend.get('op_profits', []))
+    op_cons = consecutive_growth(op_profits)
     if op_cons >= 3:
-        signals.append({'type': 'pos', 'icon': '💰', 'text': f'최근 {op_cons}년 연속 영업이익 증가'})
+        pos_signals.append({'type': 'pos', 'icon': '💰', 'text': f'최근 {op_cons}년 연속 영업이익 증가'})
     elif op_cons == 2:
-        signals.append({'type': 'pos', 'icon': '💰', 'text': '최근 2년 연속 영업이익 증가'})
+        pos_signals.append({'type': 'pos', 'icon': '💰', 'text': '최근 2년 연속 영업이익 증가'})
 
-    # 업종 평균 비교 (sector_avg 있을 때)
+    pbr = data.get('pbr')
+    if pbr and 0 < pbr < 1.0:
+        pos_signals.append({'type': 'pos', 'icon': '💎', 'text': f'PBR {pbr:.2f}배 — 청산 가치 이하 저평가'})
+
+    roe = data.get('roe')
+    if roe and roe >= 20:
+        pos_signals.append({'type': 'pos', 'icon': '🏆', 'text': f'ROE {roe:.1f}% — 우수한 자본 효율성'})
+
+    div = data.get('dividend_yield')
+    if div and div >= 0.03:
+        pos_signals.append({'type': 'pos', 'icon': '💵', 'text': f'배당수익률 {div*100:.1f}% — 고배당주'})
+
+    debt = data.get('debt_ratio')
+    if debt is not None and debt < 30:
+        pos_signals.append({'type': 'pos', 'icon': '🛡️', 'text': f'부채비율 {debt:.0f}% — 재무 안정성 우수'})
+
+    price  = data.get('current_price')
+    low52  = data.get('week52_low')
+    high52 = data.get('week52_high')
+    pos52  = None
+    if price and low52 and high52 and (high52 - low52) > 0:
+        pos52 = (price - low52) / (high52 - low52)
+        if pos52 < 0.2:
+            pos_signals.append({'type': 'pos', 'icon': '🎯', 'text': '52주 최저가 근처 — 저점 매수 기회'})
+
     if sector_avg:
         per = data.get('per')
         avg_per = sector_avg.get('avg_per')
         if per and avg_per and per > 0 and avg_per > 0:
             ratio = per / avg_per
             if ratio <= 0.75:
-                signals.append({'type': 'pos', 'icon': '⭐', 'text': f'업종 내 저평가 구간 (업종 PER {avg_per:.1f}배 대비 {int((1-ratio)*100)}% 낮음)'})
+                pos_signals.append({'type': 'pos', 'icon': '⭐',
+                    'text': f'업종 내 저평가 (업종 PER {avg_per:.1f}배 대비 {int((1-ratio)*100)}% 낮음)'})
+        if roe and sector_avg.get('avg_roe') and roe > sector_avg['avg_roe'] * 1.3:
+            pos_signals.append({'type': 'pos', 'icon': '🏆',
+                'text': f'업종 평균 ROE({sector_avg["avg_roe"]:.1f}%) 대비 우수'})
+
+    # ── 경고 시그널 (매도 주의) ───────────────────────────────────────────────
+    # 매출액 연속 감소
+    rev_dec = consecutive_decline(revenues)
+    if rev_dec >= 2:
+        warn_signals.append({'type': 'warn', 'icon': '📉',
+            'text': f'최근 {rev_dec}년 연속 매출액 감소 — 성장성 악화'})
+
+    # 영업이익 연속 감소 또는 적자
+    op_dec = consecutive_decline(op_profits)
+    if op_dec >= 2:
+        warn_signals.append({'type': 'warn', 'icon': '🔻',
+            'text': f'최근 {op_dec}년 연속 영업이익 감소 — 수익성 악화'})
+
+    valid_op = [v for v in op_profits if v is not None]
+    neg_op = sum(1 for v in valid_op if v < 0)
+    if neg_op >= 2:
+        warn_signals.append({'type': 'warn', 'icon': '🚨',
+            'text': f'최근 {neg_op}년 영업 적자 지속 — 본업 경쟁력 우려'})
+    elif neg_op == 1 and valid_op and valid_op[-1] < 0:
+        warn_signals.append({'type': 'warn', 'icon': '🚨', 'text': '최근 영업 적자 전환 — 수익성 악화'})
+
+    # ROE 마이너스 (순손실)
+    if roe is not None and roe < 0:
+        warn_signals.append({'type': 'warn', 'icon': '💸',
+            'text': f'ROE {roe:.1f}% — 순손실 (자본 잠식 위험)'})
+
+    # 부채비율 과다
+    if debt is not None:
+        if debt > 300:
+            warn_signals.append({'type': 'warn', 'icon': '⛔',
+                'text': f'부채비율 {debt:.0f}% — 매우 높은 재무 위험'})
+        elif debt > 200:
+            warn_signals.append({'type': 'warn', 'icon': '⚠️',
+                'text': f'부채비율 {debt:.0f}% — 재무 안정성 취약'})
+
+    # PER 과도한 고평가
+    per = data.get('per')
+    if per and per > 60:
+        warn_signals.append({'type': 'warn', 'icon': '💣',
+            'text': f'PER {per:.1f}배 — 과도한 고평가, 조정 위험'})
+
+    # 업종 대비 고평가
+    if sector_avg:
+        avg_per = sector_avg.get('avg_per')
+        if per and avg_per and per > 0 and avg_per > 0:
+            ratio = per / avg_per
+            if ratio >= 2.0:
+                warn_signals.append({'type': 'warn', 'icon': '⚠️',
+                    'text': f'업종 평균 PER({avg_per:.1f}배) 대비 2배 이상 고평가'})
             elif ratio >= 1.5:
-                signals.append({'type': 'warn', 'icon': '⚠️', 'text': f'업종 평균 PER 대비 고평가'})
+                warn_signals.append({'type': 'warn', 'icon': '⚠️',
+                    'text': f'업종 평균 대비 PER 고평가 구간'})
 
-        roe = data.get('roe')
-        avg_roe = sector_avg.get('avg_roe')
-        if roe and avg_roe and roe > avg_roe * 1.3:
-            signals.append({'type': 'pos', 'icon': '🏆', 'text': f'업종 평균 ROE({avg_roe:.1f}%) 대비 우수'})
+    # 52주 최고가 근처
+    if pos52 is not None and pos52 > 0.9:
+        warn_signals.append({'type': 'warn', 'icon': '📛',
+            'text': '52주 최고가 근처 — 추격 매수 위험'})
 
-    # PBR 저평가
-    pbr = data.get('pbr')
-    if pbr and 0 < pbr < 1.0:
-        signals.append({'type': 'pos', 'icon': '💎', 'text': f'PBR {pbr:.2f}배 — 청산 가치 이하 저평가'})
+    # PBR 고평가
+    if pbr and pbr > 5:
+        warn_signals.append({'type': 'warn', 'icon': '⚠️',
+            'text': f'PBR {pbr:.1f}배 — 자산 대비 매우 고평가'})
 
-    # ROE 우수
-    roe = data.get('roe')
-    if roe and roe >= 20:
-        signals.append({'type': 'pos', 'icon': '🏆', 'text': f'ROE {roe:.1f}% — 우수한 자본 효율성'})
-
-    # 고배당
-    div = data.get('dividend_yield')
-    if div and div >= 0.03:
-        signals.append({'type': 'pos', 'icon': '💵', 'text': f'배당수익률 {div*100:.1f}% — 고배당주'})
-
-    # 저부채
-    debt = data.get('debt_ratio')
-    if debt is not None and debt < 30:
-        signals.append({'type': 'pos', 'icon': '🛡️', 'text': f'부채비율 {debt:.0f}% — 재무 안정성 우수'})
-
-    # 52주 저점 매수 기회
-    price = data.get('current_price')
-    low52 = data.get('week52_low')
-    high52 = data.get('week52_high')
-    if price and low52 and high52 and (high52 - low52) > 0:
-        pos52 = (price - low52) / (high52 - low52)
-        if pos52 < 0.2:
-            signals.append({'type': 'pos', 'icon': '🎯', 'text': '52주 최저가 근처 — 저점 매수 기회'})
-        elif pos52 > 0.85:
-            signals.append({'type': 'warn', 'icon': '⚠️', 'text': '52주 최고가 근처 — 고점 주의'})
-
-    return signals[:4]  # 카드당 최대 4개
+    # 시그널 조합: 긍정/경고 각각 최대 2개, 합계 4개
+    combined = pos_signals[:2] + warn_signals[:2]
+    if len(combined) < 4:
+        combined += pos_signals[2:4-len(combined)]
+    return combined[:4]
 
 
 # ── yfinance 기본 데이터 ──────────────────────────────────────────────────────

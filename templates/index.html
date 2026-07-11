@@ -240,6 +240,7 @@
     <!-- 등급 필터 -->
     <div class="flex gap-1 bg-slate-900 border border-slate-800 rounded-xl p-1">
       <button class="filter-btn active text-xs px-3 py-1.5 rounded-lg bg-slate-700 text-white" data-filter="BUY,HOLD">🟢🔵 매수+보유</button>
+      <button class="filter-btn text-xs px-3 py-1.5 rounded-lg text-slate-400 hover:text-white" data-filter="SELL">📉 매도 주의</button>
       <button class="filter-btn text-xs px-3 py-1.5 rounded-lg text-slate-400 hover:text-white" data-filter="ALL">전체 보기</button>
     </div>
     <div class="h-4 w-px bg-slate-700"></div>
@@ -344,11 +345,18 @@ function toggleFav(ticker, e) {
 
 // ── 필터 + 정렬 적용 ──────────────────────────────────────────────────────────
 function applyAll() {
+  const isSellMode = filterGrade === 'SELL';
   const grades = filterGrade==='ALL' ? null
+    : isSellMode ? ['WATCH','AVOID']
     : filterGrade==='BUY,HOLD' ? ['BUY','HOLD'] : ['BUY'];
 
   let list = allStocks.filter(s => {
     if (grades && !grades.includes(s.scoring.grade)) return false;
+    // 매도 주의 모드: warn 시그널이 1개 이상인 종목만
+    if (isSellMode) {
+      const warnCount = (s.signals||[]).filter(sg=>sg.type==='warn').length;
+      if (warnCount < 1) return false;
+    }
     if (filterTheme !== 'ALL' && !(s.themes||[]).includes(filterTheme)) return false;
     if (favFilter && !isFav(s.ticker)) return false;
     if (searchQuery) {
@@ -365,7 +373,7 @@ function applyAll() {
     return true;
   });
 
-  if (sortMode==='score')    list.sort((a,b)=>b.scoring.total-a.scoring.total);
+  if (sortMode==='score')    list.sort((a,b)=>isSellMode ? a.scoring.total-b.scoring.total : b.scoring.total-a.scoring.total);
   else if (sortMode==='per') list.sort((a,b)=>{ if(!a.per||a.per<=0) return 1; if(!b.per||b.per<=0) return -1; return a.per-b.per; });
   else if (sortMode==='roe') list.sort((a,b)=>(b.roe??-999)-(a.roe??-999));
   else if (sortMode==='pbr') list.sort((a,b)=>{ if(!a.pbr) return 1; if(!b.pbr) return -1; return a.pbr-b.pbr; });
@@ -377,7 +385,11 @@ function cardHTML(s, rank) {
   const sc=s.scoring, cur=s.currency==='KRW'?'₩':'$';
   const price=s.current_price?`${cur}${Number(s.current_price).toLocaleString()}`:'-';
   const fav=isFav(s.ticker);
-  const signals=(s.signals||[]).slice(0,2);
+  const isSell = filterGrade === 'SELL';
+  // 매도 주의 모드: 경고 시그널을 앞에 배치하여 2개 표시
+  const signals = isSell
+    ? [...(s.signals||[]).filter(sg=>sg.type==='warn'), ...(s.signals||[]).filter(sg=>sg.type==='pos')].slice(0,2)
+    : (s.signals||[]).slice(0,2);
 
   // 등수 색상: 1~3위 금/은/동, 나머지 회색
   const rankColor = rank===1?'#fbbf24':rank===2?'#94a3b8':rank===3?'#c87941':'#334155';
@@ -393,7 +405,8 @@ function cardHTML(s, rank) {
   const sigHTML=signals.map(sg=>`<div class="${sg.type==='pos'?'sig-pos':'sig-warn'}">${sg.icon} ${sg.text}</div>`).join('');
   const themeHTML=(s.themes||[]).slice(0,2).map(t=>`<span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-950/60 text-blue-400 border border-blue-900/40">${t}</span>`).join('');
 
-  return `<div class="stock-card" onclick="openModal('${s.ticker}')">
+  const cardExtraStyle = isSell ? 'border-color:rgba(239,68,68,.35);box-shadow:0 0 0 1px rgba(239,68,68,.15);' : '';
+  return `<div class="stock-card" style="${cardExtraStyle}" onclick="openModal('${s.ticker}')">
     <div class="flex items-start justify-between mb-2">
       <div class="flex-1 min-w-0 pr-2">
         <div class="flex items-center gap-1.5">
@@ -431,7 +444,9 @@ function renderGrid() {
   document.getElementById('display-count').textContent=`${list.length}개 표시 / 분석 ${allStocks.length}개`;
   if (!list.length) {
     grid.innerHTML=''; empty.classList.remove('hidden');
-    document.getElementById('empty-text').textContent='조건에 맞는 종목이 없습니다.';
+    document.getElementById('empty-text').textContent=
+      filterGrade==='SELL' ? '매도 주의 종목이 없습니다. (경고 시그널 있는 WATCH/AVOID 등급 종목 없음)'
+      : '조건에 맞는 종목이 없습니다.';
   } else {
     empty.classList.add('hidden');
     grid.innerHTML=list.map((s,i)=>cardHTML(s,i+1)).join('');
@@ -471,12 +486,14 @@ function loadMarket(market) {
       document.getElementById('cnt-total').textContent=allStocks.length;
 
       // 카드 즉시 추가 (필터 통과 시)
-      const grades=filterGrade==='ALL'?null:filterGrade==='BUY,HOLD'?['BUY','HOLD']:['BUY'];
-      if (!grades||grades.includes(msg.data.scoring.grade)) {
+      const _isSell = filterGrade==='SELL';
+      const _grades = filterGrade==='ALL'?null:_isSell?['WATCH','AVOID']:filterGrade==='BUY,HOLD'?['BUY','HOLD']:['BUY'];
+      const _warnOk = !_isSell || (msg.data.signals||[]).some(sg=>sg.type==='warn');
+      if ((!_grades||_grades.includes(msg.data.scoring.grade)) && _warnOk) {
         if (filterTheme==='ALL'||(msg.data.themes||[]).includes(filterTheme)) {
           if (!screenerConds || Object.keys(screenerConds).length===0) {
             const el=document.createElement('div');
-            el.innerHTML=cardHTML(msg.data);
+            el.innerHTML=cardHTML(msg.data, allStocks.length);
             const child=el.firstChild;
             document.getElementById('stocks-grid').appendChild(child);
           }
@@ -720,8 +737,16 @@ document.querySelectorAll('.theme-btn').forEach(btn=>{
 // ── 등급 필터 ─────────────────────────────────────────────────────────────────
 document.querySelectorAll('.filter-btn').forEach(btn=>{
   btn.addEventListener('click',()=>{
-    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.filter-btn').forEach(b=>{
+      b.classList.remove('active');
+      b.style.background=''; b.style.color='';
+    });
     btn.classList.add('active');
+    // 매도 버튼은 붉은색 강조
+    if (btn.dataset.filter==='SELL') {
+      btn.style.background='rgba(239,68,68,.25)';
+      btn.style.color='#fca5a5';
+    }
     filterGrade=btn.dataset.filter;
     renderGrid();
   });
