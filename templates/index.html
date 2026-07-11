@@ -280,6 +280,7 @@
     <div id="m-trend"    class="mb-5"></div>
     <div id="m-signals"  class="mb-5"></div>
     <div id="m-fin"      class="mb-4"></div>
+    <div id="m-news"     class="mb-4"></div>
   </div>
 </div>
 
@@ -296,10 +297,14 @@ let favFilter     = false;
 let screenerConds = {};
 let priceChart    = null;
 let currentSSE    = null;
+let activeModalTicker = null;
 let favorites     = JSON.parse(localStorage.getItem('stockwise_favs') || '[]');
 
 // ── 유틸 ──────────────────────────────────────────────────────────────────────
 const f = (v, d=2, fb='-') => (v == null) ? fb : Number(v).toFixed(d);
+const esc = v => String(v??'').replace(/[&<>"']/g, c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
 function fmtMoney(v, cur='KRW') {
   if (!v) return '-';
   const a=Math.abs(v), s=v<0?'-':'';
@@ -528,26 +533,81 @@ function loadMarket(market) {
 
 // ── 모달 ──────────────────────────────────────────────────────────────────────
 async function openModal(ticker) {
+  activeModalTicker=ticker;
   document.getElementById('modal-bg').classList.remove('hidden');
   if (priceChart) { priceChart.destroy(); priceChart=null; }
-  ['m-header','m-metrics','m-score','m-trend','m-signals','m-fin']
+  ['m-header','m-metrics','m-score','m-trend','m-signals','m-fin','m-news']
     .forEach(id=>document.getElementById(id).innerHTML='<div class="sk h-16 rounded-xl"></div>');
 
   try {
     const res=await fetch(`/api/stock/${ticker}`);
     const json=await res.json();
     if (json.status!=='ok') throw new Error(json.message);
+    if (activeModalTicker!==ticker) return;
     renderModal(json.data);
+    const selected=allStocks.find(s=>s.ticker===ticker);
+    loadCompanyNews(ticker, selected?.name||json.data.long_name||ticker);
   } catch(err) {
     document.getElementById('m-header').innerHTML=`<p class="text-red-400">로딩 실패: ${err.message}</p>`;
   }
 }
 function closeModal() {
+  activeModalTicker=null;
   document.getElementById('modal-bg').classList.add('hidden');
   if (priceChart) { priceChart.destroy(); priceChart=null; }
 }
 function maybeClose(e) { if(e.target===document.getElementById('modal-bg')) closeModal(); }
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+
+async function loadCompanyNews(ticker, companyName) {
+  const target=document.getElementById('m-news');
+  target.innerHTML='<div class="sk h-28 rounded-xl"></div>';
+  try {
+    const res=await fetch(`/api/news?name=${encodeURIComponent(companyName)}`);
+    const json=await res.json();
+    if (json.status!=='ok') throw new Error(json.message||'뉴스를 불러오지 못했습니다.');
+    if (activeModalTicker!==ticker) return;
+    renderCompanyNews(json.data);
+  } catch(err) {
+    if (activeModalTicker!==ticker) return;
+    target.innerHTML=`
+      <div class="bg-slate-900/40 border border-slate-800 rounded-xl p-5">
+        <h3 class="font-semibold text-white mb-2">📰 최근 기업 뉴스</h3>
+        <p class="text-sm text-red-300">${esc(err.message)}</p>
+      </div>`;
+  }
+}
+
+function renderCompanyNews(data) {
+  const articles=data.articles||[];
+  if (!articles.length) {
+    document.getElementById('m-news').innerHTML=`
+      <div class="bg-slate-900/40 border border-slate-800 rounded-xl p-5">
+        <h3 class="font-semibold text-white mb-2">📰 최근 기업 뉴스</h3>
+        <p class="text-sm text-slate-500">최근 3개월 내 관련 기사가 없습니다.</p>
+      </div>`;
+    return;
+  }
+  const items=articles.map(article=>`
+    <a href="${esc(article.link)}" target="_blank" rel="noopener noreferrer"
+      class="block px-4 py-3 rounded-xl border border-slate-800 bg-slate-950/40 hover:border-blue-700 hover:bg-blue-950/20 transition">
+      <div class="flex items-center justify-between gap-3 mb-1">
+        <span class="text-[11px] text-blue-400 truncate">${esc(article.source)}</span>
+        <time class="text-[11px] text-slate-600 shrink-0">${esc(article.published_at)}</time>
+      </div>
+      <h4 class="text-sm font-semibold text-slate-100 mb-1">${esc(article.title)}</h4>
+      <p class="text-xs text-slate-400 leading-relaxed line-clamp-2">${esc(article.summary)}</p>
+    </a>`).join('');
+  document.getElementById('m-news').innerHTML=`
+    <div class="bg-slate-900/40 border border-slate-800 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-white">📰 최근 3개월 기업 뉴스</h3>
+        <span class="text-xs text-slate-500">${articles.length}건</span>
+      </div>
+      <div class="grid gap-2">${items}</div>
+      <p class="text-[11px] text-slate-600 mt-3">기사 제목이나 요약을 누르면 원문으로 이동합니다.</p>
+    </div>`;
+}
 
 function renderModal(d) {
   const sc=d.scoring, grade=sc.grade, color=gc(grade);

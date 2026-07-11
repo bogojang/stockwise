@@ -7,13 +7,17 @@ import json
 import os
 import queue
 import io
+import html
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 import requests
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -21,6 +25,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 DART_API_KEY = os.getenv('DART_API_KEY', '').strip()
+NAVER_CLIENT_ID = os.getenv('NAVER_CLIENT_ID', '').strip()
+NAVER_CLIENT_SECRET = os.getenv('NAVER_CLIENT_SECRET', '').strip()
 
 # ── 캐시 ─────────────────────────────────────────────────────────────────────
 _cache: dict = {}
@@ -981,6 +987,92 @@ def api_market_stream(market: str):
         content_type='text/event-stream',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
+
+
+# ── 기업 뉴스 ─────────────────────────────────────────────────────────────────
+def _clean_news_text(value: str) -> str:
+    """네이버 검색 결과의 강조 태그와 HTML 엔티티를 제거한다."""
+    without_tags = re.sub(r'<[^>]+>', '', value or '')
+    return html.unescape(without_tags).strip()
+
+
+@app.route('/api/news')
+def api_news():
+    company_name = request.args.get('name', '').strip()
+    if not company_name:
+        return jsonify({'status': 'error', 'message': '회사명이 필요합니다.'}), 400
+    if len(company_name) > 80:
+        return jsonify({'status': 'error', 'message': '회사명이 너무 깁니다.'}), 400
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return jsonify({
+            'status': 'error',
+            'message': '네이버 뉴스 API 환경변수가 설정되지 않았습니다.',
+        }), 503
+
+    cache_key = f"news_{company_name.casefold()}"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return jsonify({'status': 'ok', 'data': cached, 'cached': True})
+
+    try:
+        response = requests.get(
+            'https://openapi.naver.com/v1/search/news.json',
+            headers={
+                'X-Naver-Client-Id': NAVER_CLIENT_ID,
+                'X-Naver-Client-Secret': NAVER_CLIENT_SECRET,
+            },
+            params={
+                'query': f'"{company_name}" 기업',
+                'display': 100,
+                'start': 1,
+                'sort': 'date',
+            },
+            timeout=15,
+        )
+        if response.status_code == 401:
+            raise RuntimeError('네이버 API 인증에 실패했습니다. Client ID와 Secret을 확인해 주세요.')
+        if response.status_code == 429:
+            raise RuntimeError('네이버 뉴스 API의 일일 호출 한도를 초과했습니다.')
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        logger.warning(f'[네이버 뉴스 조회 실패] {exc}')
+        return jsonify({'status': 'error', 'message': str(exc)}), 502
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+    articles = []
+    for item in payload.get('items', []):
+        try:
+            published = parsedate_to_datetime(item.get('pubDate', ''))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if published < cutoff:
+            continue
+
+        link = item.get('originallink') or item.get('link') or ''
+        parsed_link = urlparse(link)
+        if parsed_link.scheme not in ('http', 'https'):
+            continue
+        source = parsed_link.netloc.removeprefix('www.')
+        articles.append({
+            'title': _clean_news_text(item.get('title', '')),
+            'summary': _clean_news_text(item.get('description', '')),
+            'link': link,
+            'source': source,
+            'published_at': published.astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M'),
+        })
+        if len(articles) >= 12:
+            break
+
+    result = {
+        'company_name': company_name,
+        'period_days': 90,
+        'articles': articles,
+    }
+    set_cache(cache_key, result)
+    return jsonify({'status': 'ok', 'data': result, 'cached': False})
 
 
 # ── 종목 상세 ─────────────────────────────────────────────────────────────────
