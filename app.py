@@ -1192,7 +1192,16 @@ def api_news():
     cache_key = f"news_{company_name.casefold()}"
     cached = get_cache(cache_key)
     if cached is not None:
-        return jsonify({'status': 'ok', 'data': cached, 'cached': True})
+        articles = sorted(
+            cached.get('articles') or [],
+            key=lambda a: a.get('published_at') or '',
+            reverse=True,
+        )
+        return jsonify({
+            'status': 'ok',
+            'data': {**cached, 'articles': articles},
+            'cached': True,
+        })
 
     try:
         response = requests.get(
@@ -1236,15 +1245,21 @@ def api_news():
         if parsed_link.scheme not in ('http', 'https'):
             continue
         source = parsed_link.netloc.removeprefix('www.')
+        published_kst = published.astimezone(KST)
         articles.append({
             'title': _clean_news_text(item.get('title', '')),
             'summary': _clean_news_text(item.get('description', '')),
             'link': link,
             'source': source,
-            'published_at': published.astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M'),
+            'published_at': published_kst.strftime('%Y-%m-%d %H:%M'),
+            'published_ts': published_kst.timestamp(),
         })
-        if len(articles) >= 12:
-            break
+
+    # 최신 기사가 항상 맨 위에 오도록 명시적으로 정렬한다.
+    articles.sort(key=lambda a: a.get('published_ts') or 0, reverse=True)
+    articles = articles[:12]
+    for article in articles:
+        article.pop('published_ts', None)
 
     result = {
         'company_name': company_name,
