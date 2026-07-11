@@ -518,7 +518,13 @@ def _dart_corp_codes() -> dict[str, str]:
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             root = ET.fromstring(archive.read(archive.namelist()[0]))
     except (zipfile.BadZipFile, IndexError, ET.ParseError) as exc:
-        raise RuntimeError('OpenDART 고유번호 응답을 해석하지 못했습니다.') from exc
+        try:
+            error_root = ET.fromstring(response.content)
+            status = error_root.findtext('status') or '알 수 없음'
+            message = error_root.findtext('message') or '응답 해석 실패'
+            raise RuntimeError(f'OpenDART 인증 오류 {status}: {message}') from exc
+        except ET.ParseError:
+            raise RuntimeError('OpenDART 고유번호 응답을 해석하지 못했습니다.') from exc
 
     mapping = {}
     for item in root.findall('list'):
@@ -572,20 +578,48 @@ def fetch_dart_financials(stock_codes: list[str]) -> dict[str, dict]:
         return {}
 
     corp_map = _dart_corp_codes()
-    reverse_map = {corp: stock for stock, corp in corp_map.items() if stock in stock_codes}
-    corp_codes = list(reverse_map)
+    # 시가총액순 종목 순서를 유지해 첫 묶음에 대표 기업들이 포함되도록 한다.
+    corp_codes = [corp_map[stock] for stock in stock_codes if stock in corp_map]
+    reverse_map = {corp_map[stock]: stock for stock in stock_codes if stock in corp_map}
+    if not corp_codes:
+        raise RuntimeError('OpenDART 종목코드와 KRX 종목코드를 연결하지 못했습니다.')
+
     batches = [corp_codes[i:i + 100] for i in range(0, len(corp_codes), 100)]
-    latest_year = datetime.now().year - 1
-    rows = []
+    requested_year = datetime.now().year - 1
+
+    # 사업보고서 제출 시기나 DART 반영 지연을 고려하여 최근 3개 연도를 순서대로 확인한다.
+    latest_year = None
+    first_rows = []
+    for candidate_year in range(requested_year, requested_year - 3, -1):
+        first_rows = _fetch_dart_batch(batches[0], candidate_year)
+        if first_rows:
+            latest_year = candidate_year
+            break
+    if latest_year is None:
+        raise RuntimeError(
+            f'OpenDART에서 {requested_year}~{requested_year - 2}년 사업보고서 데이터를 찾지 못했습니다.'
+        )
+    if latest_year != requested_year:
+        logger.warning(f'[OpenDART] 최신 데이터가 없어 {latest_year}년 사업보고서를 사용합니다.')
 
     # 최대 100개 회사씩 조회할 수 있어 종목별 API 호출보다 훨씬 빠르다.
+    rows = list(first_rows)
+    failed_batches = 0
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(_fetch_dart_batch, batch, latest_year) for batch in batches]
+        futures = [
+            executor.submit(_fetch_dart_batch, batch, latest_year)
+            for batch in batches[1:]
+        ]
         for future in as_completed(futures):
             try:
                 rows.extend(future.result())
             except Exception as exc:
+                failed_batches += 1
                 logger.warning(f'[OpenDART 배치 실패] {exc}')
+    if not rows:
+        raise RuntimeError('OpenDART 재무제표 응답이 비어 있습니다.')
+    if failed_batches == len(batches) - 1 and len(batches) > 1:
+        raise RuntimeError('OpenDART 재무제표 배치 조회가 모두 실패했습니다.')
 
     result: dict[str, dict] = {}
     period_fields = [
@@ -611,6 +645,14 @@ def fetch_dart_financials(stock_codes: list[str]) -> dict[str, dict]:
 
     for (stock_code, year, account), (_, amount) in selected.items():
         result.setdefault(stock_code, {}).setdefault(year, {})[account] = amount
+    coverage = len(result) / len(stock_codes) if stock_codes else 0
+    if coverage < 0.1:
+        raise RuntimeError(
+            f'OpenDART 재무 데이터 연결률이 너무 낮습니다 ({len(result)}/{len(stock_codes)}개).'
+        )
+    logger.warning(
+        f'[OpenDART] {latest_year}년 기준 재무 데이터 {len(result)}/{len(stock_codes)}개 연결 완료'
+    )
     return result
 
 
@@ -889,7 +931,8 @@ def api_market_stream(market: str):
                 dart_data = fetch_dart_financials([item['kr_code'] for item in listing])
             except Exception as exc:
                 logger.warning(f'[OpenDART 전체 조회 실패] {exc}')
-                dart_data = {}
+                yield f"data: {json.dumps({'type':'error','message':f'OpenDART 재무정보 조회 실패: {exc}'})}\n\n"
+                return
 
             for scanned, meta in enumerate(listing, 1):
                 res = build_bulk_result(meta, market, dart_data)
