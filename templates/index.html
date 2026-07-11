@@ -466,9 +466,8 @@ function loadMarket(market) {
   ['cnt-buy','cnt-hold','cnt-total'].forEach(id=>document.getElementById(id).textContent='0');
   document.getElementById('progress-bar').style.width='0%';
 
-  const limits={KOSPI:200,KOSDAQ:150};
   document.getElementById('scan-text').textContent=
-    `${market} 시총 상위 ${limits[market]}개 종목 분석 중... 매출·영업이익 3~4년 트렌드 + 업종 평균 비교`;
+    `${market} 전체 종목 불러오는 중... KRX 투자지표 + OpenDART 최근 3개년 재무제표 비교`;
 
   currentSSE = new EventSource(`/api/market/${market}/stream`);
 
@@ -503,6 +502,7 @@ function loadMarket(market) {
 
     else if (msg.type==='progress') {
       document.getElementById('progress-bar').style.width=`${Math.round(msg.scanned/msg.total*100)}%`;
+      if (msg.message) document.getElementById('scan-text').textContent=msg.message;
     }
 
     else if (msg.type==='done') {

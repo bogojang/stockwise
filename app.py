@@ -6,10 +6,14 @@ import pandas as pd
 import json
 import os
 import queue
+import io
+import zipfile
+import xml.etree.ElementTree as ET
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 load_dotenv()
 
@@ -483,49 +487,174 @@ _KOSDAQ_RAW = [
 ]
 
 
-def _listing_from_pykrx(market: str) -> list[dict]:
-    """KRX에서 실시간 시총 상위 종목 목록 가져오기"""
-    from pykrx import stock as pykrx_stock
+def _number(value):
+    """DART의 쉼표 포함 금액 문자열을 숫자로 변환한다."""
+    if value in (None, '', '-'):
+        return None
+    try:
+        text = str(value).replace(',', '').strip()
+        if text.startswith('(') and text.endswith(')'):
+            text = f"-{text[1:-1]}"
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
-    today = datetime.now()
-    # 주말이면 직전 금요일로
-    while today.weekday() >= 5:
-        today -= timedelta(days=1)
-    date_str = today.strftime('%Y%m%d')
 
-    limit = 80 if market == 'KOSPI' else 60
+def _dart_corp_codes() -> dict[str, str]:
+    """상장 종목코드 → DART 고유번호 매핑을 가져온다."""
+    cached = get_cache('dart_corp_codes')
+    if cached is not None:
+        return cached
+    if not DART_API_KEY:
+        raise RuntimeError('DART_API_KEY 환경변수가 설정되지 않았습니다.')
+
+    response = requests.get(
+        'https://opendart.fss.or.kr/api/corpCode.xml',
+        params={'crtfc_key': DART_API_KEY},
+        timeout=30,
+    )
+    response.raise_for_status()
+    try:
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            root = ET.fromstring(archive.read(archive.namelist()[0]))
+    except (zipfile.BadZipFile, IndexError, ET.ParseError) as exc:
+        raise RuntimeError('OpenDART 고유번호 응답을 해석하지 못했습니다.') from exc
+
+    mapping = {}
+    for item in root.findall('list'):
+        stock_code = (item.findtext('stock_code') or '').strip()
+        corp_code = (item.findtext('corp_code') or '').strip()
+        if stock_code and corp_code:
+            mapping[stock_code.zfill(6)] = corp_code
+    set_cache('dart_corp_codes', mapping)
+    return mapping
+
+
+def _dart_account_key(name: str) -> str | None:
+    normalized = name.replace(' ', '')
+    if normalized in ('매출액', '수익(매출액)', '영업수익', '보험영업수익'):
+        return 'revenue'
+    if normalized in ('영업이익', '영업이익(손실)'):
+        return 'operating_profit'
+    if normalized in ('당기순이익', '당기순이익(손실)', '연결당기순이익'):
+        return 'net_income'
+    if normalized == '자본총계':
+        return 'equity'
+    if normalized == '부채총계':
+        return 'liabilities'
+    return None
+
+
+def _fetch_dart_batch(corp_codes: list[str], latest_year: int) -> list[dict]:
+    response = requests.get(
+        'https://opendart.fss.or.kr/api/fnlttMultiAcnt.json',
+        params={
+            'crtfc_key': DART_API_KEY,
+            'corp_code': ','.join(corp_codes),
+            'bsns_year': str(latest_year),
+            'reprt_code': '11011',
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get('status') == '013':
+        return []
+    if payload.get('status') != '000':
+        raise RuntimeError(f"OpenDART 오류 {payload.get('status')}: {payload.get('message')}")
+    return payload.get('list', [])
+
+
+def fetch_dart_financials(stock_codes: list[str]) -> dict[str, dict]:
+    """전체 종목의 최근 3개년 주요 재무계정을 100개 단위로 일괄 조회한다."""
+    if not DART_API_KEY:
+        logger.warning('[OpenDART] DART_API_KEY가 없어 재무제표 조회를 건너뜁니다.')
+        return {}
+
+    corp_map = _dart_corp_codes()
+    reverse_map = {corp: stock for stock, corp in corp_map.items() if stock in stock_codes}
+    corp_codes = list(reverse_map)
+    batches = [corp_codes[i:i + 100] for i in range(0, len(corp_codes), 100)]
+    latest_year = datetime.now().year - 1
+    rows = []
+
+    # 최대 100개 회사씩 조회할 수 있어 종목별 API 호출보다 훨씬 빠르다.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_fetch_dart_batch, batch, latest_year) for batch in batches]
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception as exc:
+                logger.warning(f'[OpenDART 배치 실패] {exc}')
+
+    result: dict[str, dict] = {}
+    period_fields = [
+        (latest_year, 'thstrm_amount'),
+        (latest_year - 1, 'frmtrm_amount'),
+        (latest_year - 2, 'bfefrmtrm_amount'),
+    ]
+    # 동일 계정이 CFS/OFS 양쪽에 있으면 연결재무제표(CFS)를 우선한다.
+    selected: dict[tuple, tuple[int, float]] = {}
+    for row in rows:
+        stock_code = reverse_map.get(row.get('corp_code', ''))
+        account = _dart_account_key(row.get('account_nm', ''))
+        if not stock_code or not account:
+            continue
+        priority = 1 if row.get('fs_div') == 'CFS' else 0
+        for year, field in period_fields:
+            amount = _number(row.get(field))
+            if amount is None:
+                continue
+            key = (stock_code, year, account)
+            if key not in selected or priority > selected[key][0]:
+                selected[key] = (priority, amount)
+
+    for (stock_code, year, account), (_, amount) in selected.items():
+        result.setdefault(stock_code, {}).setdefault(year, {})[account] = amount
+    return result
+
+
+def _listing_from_fdr(market: str) -> list[dict]:
+    """FinanceDataReader에서 KOSPI/KOSDAQ 전체 종목을 일괄 조회한다."""
+    import FinanceDataReader as fdr
+
     suffix = '.KS' if market == 'KOSPI' else '.KQ'
-
-    df = pykrx_stock.get_market_cap_by_ticker(date_str, market=market)
+    df = fdr.StockListing('KRX')
     if df is None or df.empty:
-        raise ValueError('pykrx 데이터 없음')
-
-    df = df.sort_values('시가총액', ascending=False).head(limit)
+        raise ValueError('KRX 전체 종목 데이터 없음')
+    markets = ['KOSPI'] if market == 'KOSPI' else ['KOSDAQ', 'KOSDAQ GLOBAL']
+    df = df[df['Market'].isin(markets)].drop_duplicates(subset=['Code'])
+    df = df.sort_values('Marcap', ascending=False)
 
     result = []
-    for ticker in df.index:
-        try:
-            name = pykrx_stock.get_market_ticker_name(ticker)
-        except Exception:
-            name = ticker
+    for _, row in df.iterrows():
+        ticker = str(row['Code']).zfill(6)
         result.append({
             'ticker':   f"{ticker}{suffix}",
             'kr_code':  ticker,
-            'name':     name,
+            'name':     row.get('Name') or ticker,
             'sector':   '-',
             'industry': '-',
+            'bulk_data': {
+                'per': None,
+                'pbr': None,
+                'roe': None,
+                'dividend_yield': None,
+                'market_cap': _number(row.get('Marcap')),
+                'current_price': _number(row.get('Close')),
+            },
         })
     return result
 
 
 def get_listing(market: str) -> list[dict]:
-    """pykrx(실시간) → 실패 시 하드코딩 폴백"""
+    """KRX 전체 종목 → 실패 시 하드코딩 폴백"""
     try:
-        result = _listing_from_pykrx(market)
-        logger.info(f"[pykrx] {market} {len(result)}개 로드")
+        result = _listing_from_fdr(market)
+        logger.info(f"[FinanceDataReader] {market} 전체 {len(result)}개 로드")
         return result
     except Exception as e:
-        logger.warning(f"[pykrx 실패, 폴백 사용] {e}")
+        logger.warning(f"[KRX 전체 목록 실패, 폴백 사용] {e}")
         suffix = '.KS' if market == 'KOSPI' else '.KQ'
         raw = _KOSPI_RAW if market == 'KOSPI' else _KOSDAQ_RAW
         return [
@@ -536,6 +665,83 @@ def get_listing(market: str) -> list[dict]:
 
 
 # ── 종목 결과 조립 ────────────────────────────────────────────────────────────
+def build_bulk_result(meta: dict, market: str, dart_data: dict) -> dict:
+    """KRX 일괄 시세와 OpenDART 재무제표로 전체시장 분석 결과를 만든다."""
+    data = dict(meta.get('bulk_data') or {})
+    yearly = dart_data.get(meta.get('kr_code'), {})
+    years = sorted(yearly)[-3:]
+    revenues = [yearly[y].get('revenue') for y in years]
+    op_profits = [yearly[y].get('operating_profit') for y in years]
+    trend = {
+        'year_labels': [str(y) for y in years],
+        'revenues': revenues,
+        'op_profits': op_profits,
+    }
+
+    latest = yearly.get(years[-1], {}) if years else {}
+    previous = yearly.get(years[-2], {}) if len(years) >= 2 else {}
+    equity = latest.get('equity')
+    liabilities = latest.get('liabilities')
+    net_income = latest.get('net_income')
+    revenue = latest.get('revenue')
+    operating_profit = latest.get('operating_profit')
+    previous_revenue = previous.get('revenue')
+    market_cap = data.get('market_cap')
+
+    if equity and equity > 0:
+        if net_income is not None:
+            data['roe'] = round(net_income / equity * 100, 2)
+        if liabilities is not None:
+            data['debt_ratio'] = round(liabilities / equity * 100, 2)
+        if market_cap:
+            data['pbr'] = round(market_cap / equity, 2)
+    else:
+        data['debt_ratio'] = None
+    if market_cap and net_income and net_income > 0:
+        data['per'] = round(market_cap / net_income, 2)
+    data['revenue_growth'] = (
+        round((revenue / previous_revenue - 1) * 100, 2)
+        if revenue is not None and previous_revenue not in (None, 0) else None
+    )
+    data['operating_margin'] = (
+        round(operating_profit / revenue * 100, 2)
+        if operating_profit is not None and revenue not in (None, 0) else None
+    )
+
+    sector = meta.get('sector') or '-'
+    industry = meta.get('industry') or '-'
+    name = meta.get('name') or meta['ticker']
+    themes = classify_themes(sector, industry, name)
+    scoring = calculate_score(
+        data.get('per'), data.get('pbr'), data.get('roe'), data.get('debt_ratio')
+    )
+    full = {**data, 'financial_trend': trend}
+    return {
+        'ticker': meta['ticker'],
+        'kr_code': meta.get('kr_code', ''),
+        'name': name,
+        'market': market,
+        'sector': sector,
+        'industry': industry,
+        'themes': themes,
+        'per': data.get('per'),
+        'pbr': data.get('pbr'),
+        'roe': data.get('roe'),
+        'debt_ratio': data.get('debt_ratio'),
+        'revenue_growth': data.get('revenue_growth'),
+        'operating_margin': data.get('operating_margin'),
+        'dividend_yield': data.get('dividend_yield'),
+        'current_price': data.get('current_price'),
+        'currency': 'KRW',
+        'market_cap': data.get('market_cap'),
+        'week52_high': None,
+        'week52_low': None,
+        'financial_trend': trend,
+        'signals': generate_signals(full),
+        'scoring': scoring,
+    }
+
+
 def build_result(meta: dict, market: str, sector_avg: dict = None) -> dict | None:
     ticker = meta['ticker']
     data   = fetch_stock_data(ticker)
@@ -672,30 +878,47 @@ def api_market_stream(market: str):
             return
 
         total = len(listing)
-        result_queue = queue.Queue()
         all_results = []
+        is_bulk_listing = bool(listing and listing[0].get('bulk_data') is not None)
 
-        def worker(meta):
-            res = build_result(meta, market)
-            result_queue.put(res)
-
-        executor = ThreadPoolExecutor(max_workers=8)
-        for meta in listing:
-            executor.submit(worker, meta)
-        executor.shutdown(wait=False)
-
-        scanned = 0
-        while scanned < total:
+        if is_bulk_listing:
+            # KRX 시세는 전체 시장을 일괄 조회하고 DART도 최대 100개 회사씩 조회한다.
+            # 종목마다 yfinance를 호출하지 않아 전체 시장에서도 요청 제한을 피할 수 있다.
+            yield f"data: {json.dumps({'type':'progress','scanned':0,'total':total,'message':'OpenDART 재무제표 조회 중'})}\n\n"
             try:
-                res = result_queue.get(timeout=90)
-                scanned += 1
-                if res:
-                    all_results.append(res)
-                    yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type':'progress','scanned':scanned,'total':total})}\n\n"
-            except queue.Empty:
-                break
+                dart_data = fetch_dart_financials([item['kr_code'] for item in listing])
+            except Exception as exc:
+                logger.warning(f'[OpenDART 전체 조회 실패] {exc}')
+                dart_data = {}
+
+            for scanned, meta in enumerate(listing, 1):
+                res = build_bulk_result(meta, market, dart_data)
+                all_results.append(res)
+                yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
+        else:
+            # 전체 목록 조회 장애로 내장 목록을 사용하는 경우에만 기존 단건 조회를 사용한다.
+            result_queue = queue.Queue()
+
+            def worker(meta):
+                result_queue.put(build_result(meta, market))
+
+            executor = ThreadPoolExecutor(max_workers=8)
+            for meta in listing:
+                executor.submit(worker, meta)
+            executor.shutdown(wait=False)
+
+            scanned = 0
+            while scanned < total:
+                try:
+                    res = result_queue.get(timeout=90)
+                    scanned += 1
+                    if res:
+                        all_results.append(res)
+                        yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type':'progress','scanned':scanned,'total':total})}\n\n"
+                except queue.Empty:
+                    break
 
         # 업종 평균 계산 후 최종 시그널 업데이트
         sector_avgs = calc_sector_averages(all_results)
