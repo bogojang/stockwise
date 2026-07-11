@@ -1,0 +1,53 @@
+name: Refresh market data
+
+on:
+  schedule:
+    # 장중 시세 갱신 (KST 09:05~15:05 ≈ UTC 00:05~06:05, 평일)
+    - cron: '5 0-6 * * 1-5'
+    # 장 시작 전 전체 분석 (KST 08:00 ≈ UTC 23:00, 일~목)
+    - cron: '0 23 * * 0-4'
+    # 장 마감 후 전체 분석 (KST 16:30 ≈ UTC 07:30, 평일)
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'full=전체분석, prices=시세만'
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - prices
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Decide refresh mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 23 * * 0-4" ] || [ "${{ github.event.schedule }}" = "30 7 * * 1-5" ]; then
+            echo "value=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=prices" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wake Render service
+        run: |
+          curl -fsS --max-time 120 "${{ secrets.APP_URL }}/" >/dev/null || true
+          sleep 5
+
+      - name: Refresh KOSPI
+        run: |
+          curl -fsS --max-time 900 \
+            -H "X-Refresh-Secret: ${{ secrets.REFRESH_SECRET }}" \
+            "${{ secrets.APP_URL }}/api/refresh?mode=${{ steps.mode.outputs.value }}&market=KOSPI"
+
+      - name: Refresh KOSDAQ
+        run: |
+          curl -fsS --max-time 900 \
+            -H "X-Refresh-Secret: ${{ secrets.REFRESH_SECRET }}" \
+            "${{ secrets.APP_URL }}/api/refresh?mode=${{ steps.mode.outputs.value }}&market=KOSDAQ"

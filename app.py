@@ -16,8 +16,10 @@ from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+from pathlib import Path
 
 load_dotenv()
 
@@ -27,11 +29,17 @@ logger = logging.getLogger(__name__)
 DART_API_KEY = os.getenv('DART_API_KEY', '').strip()
 NAVER_CLIENT_ID = os.getenv('NAVER_CLIENT_ID', '').strip()
 NAVER_CLIENT_SECRET = os.getenv('NAVER_CLIENT_SECRET', '').strip()
+REFRESH_SECRET = os.getenv('REFRESH_SECRET', '').strip()
+KST = timezone(timedelta(hours=9))
+DATA_DIR = Path(__file__).resolve().parent / 'data'
+DATA_DIR.mkdir(exist_ok=True)
 
 # ── 캐시 ─────────────────────────────────────────────────────────────────────
 _cache: dict = {}
 _cache_times: dict = {}
-CACHE_TTL = 3600  # 1시간
+CACHE_TTL = 3600  # 뉴스 등 단기 캐시
+_refresh_lock = threading.Lock()
+_market_meta: dict[str, dict] = {}
 
 def get_cache(key):
     if key in _cache and time.time() - _cache_times.get(key, 0) < CACHE_TTL:
@@ -41,6 +49,83 @@ def get_cache(key):
 def set_cache(key, value):
     _cache[key] = value
     _cache_times[key] = time.time()
+
+
+def _now_kst_iso() -> str:
+    return datetime.now(KST).isoformat(timespec='seconds')
+
+
+def _market_path(market: str) -> Path:
+    return DATA_DIR / f'market_{market.upper()}.json'
+
+
+def save_market_snapshot(market: str, stocks: list, mode: str = 'full') -> dict:
+    """분석 결과를 메모리와 디스크에 저장한다. 접속 시 재스캔하지 않도록 한다."""
+    market = market.upper()
+    now = _now_kst_iso()
+    prev = _market_meta.get(market, {})
+    meta = {
+        'market': market,
+        'updated_at': now,
+        'full_updated_at': now if mode == 'full' else prev.get('full_updated_at'),
+        'prices_updated_at': now,
+        'mode': mode,
+        'count': len(stocks),
+    }
+    payload = {**meta, 'stocks': stocks}
+    _cache[f'market_{market}'] = stocks
+    _cache_times[f'market_{market}'] = time.time()
+    _market_meta[market] = meta
+    try:
+        _market_path(market).write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding='utf-8',
+        )
+    except OSError as exc:
+        logger.warning(f'[저장 실패] {market}: {exc}')
+    return meta
+
+
+def load_market_snapshot(market: str) -> dict | None:
+    market = market.upper()
+    path = _market_path(market)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        stocks = payload.get('stocks') or []
+        meta = {
+            'market': market,
+            'updated_at': payload.get('updated_at'),
+            'full_updated_at': payload.get('full_updated_at'),
+            'prices_updated_at': payload.get('prices_updated_at'),
+            'mode': payload.get('mode', 'full'),
+            'count': len(stocks),
+        }
+        _cache[f'market_{market}'] = stocks
+        _cache_times[f'market_{market}'] = time.time()
+        _market_meta[market] = meta
+        return payload
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f'[로드 실패] {market}: {exc}')
+        return None
+
+
+def get_market_stocks(market: str) -> list | None:
+    """만료 없이 저장된 시장 데이터를 반환한다. 갱신은 /api/refresh 전용."""
+    market = market.upper()
+    cached = _cache.get(f'market_{market}')
+    if cached is not None:
+        return cached
+    payload = load_market_snapshot(market)
+    return payload.get('stocks') if payload else None
+
+
+def get_market_meta(market: str) -> dict:
+    market = market.upper()
+    if market not in _market_meta:
+        load_market_snapshot(market)
+    return _market_meta.get(market, {})
 
 
 # ── 테마 분류 ─────────────────────────────────────────────────────────────────
@@ -785,6 +870,9 @@ def build_bulk_result(meta: dict, market: str, dart_data: dict) -> dict:
         'week52_high': None,
         'week52_low': None,
         'financial_trend': trend,
+        'equity': equity,
+        'net_income_annual': net_income,
+        'liabilities': liabilities,
         'signals': generate_signals(full),
         'scoring': scoring,
     }
@@ -858,6 +946,97 @@ def calc_sector_averages(stocks: list) -> dict:
     return result
 
 
+def finalize_market_results(all_results: list) -> list:
+    sector_avgs = calc_sector_averages(all_results)
+    for s in all_results:
+        sec_avg = sector_avgs.get(s.get('sector', '-'))
+        s['signals'] = generate_signals(s, sec_avg)
+    all_results.sort(key=lambda x: x['scoring']['total'], reverse=True)
+    return all_results
+
+
+def apply_price_update(stock: dict, bulk_data: dict) -> dict:
+    """기존 재무 지표는 유지하고 시세·시총만 갱신한 뒤 PER/PBR/점수를 재계산한다."""
+    updated = dict(stock)
+    market_cap = bulk_data.get('market_cap')
+    updated['current_price'] = bulk_data.get('current_price')
+    updated['market_cap'] = market_cap
+    if bulk_data.get('dividend_yield') is not None:
+        updated['dividend_yield'] = bulk_data.get('dividend_yield')
+
+    equity = updated.get('equity')
+    net_income = updated.get('net_income_annual')
+    if equity and equity > 0 and market_cap:
+        updated['pbr'] = round(market_cap / equity, 2)
+    if market_cap and net_income and net_income > 0:
+        updated['per'] = round(market_cap / net_income, 2)
+
+    updated['scoring'] = calculate_score(
+        updated.get('per'), updated.get('pbr'), updated.get('roe'), updated.get('debt_ratio')
+    )
+    return updated
+
+
+def analyze_market_full(market: str) -> dict:
+    """종목 목록 + OpenDART 재무를 포함한 전체 재분석."""
+    market = market.upper()
+    listing = get_listing(market)
+    all_results = []
+    is_bulk_listing = bool(listing and listing[0].get('bulk_data') is not None)
+
+    if is_bulk_listing:
+        dart_data = fetch_dart_financials([item['kr_code'] for item in listing])
+        for meta in listing:
+            all_results.append(build_bulk_result(meta, market, dart_data))
+    else:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(build_result, meta, market) for meta in listing]
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    all_results.append(res)
+
+    all_results = finalize_market_results(all_results)
+    meta = save_market_snapshot(market, all_results, mode='full')
+    return {'meta': meta, 'stocks': all_results}
+
+
+def refresh_market_prices(market: str) -> dict:
+    """시세·시총만 빠르게 갱신. 저장된 전체 분석이 없으면 전체 분석으로 대체."""
+    market = market.upper()
+    existing = get_market_stocks(market)
+    if not existing:
+        return analyze_market_full(market)
+
+    listing = get_listing(market)
+    listing_by_code = {
+        item['kr_code']: item
+        for item in listing
+        if item.get('kr_code') and item.get('bulk_data') is not None
+    }
+    existing_by_code = {s.get('kr_code'): s for s in existing if s.get('kr_code')}
+
+    refreshed = []
+    for code, meta in listing_by_code.items():
+        prev = existing_by_code.get(code)
+        if prev:
+            refreshed.append(apply_price_update(prev, meta.get('bulk_data') or {}))
+        else:
+            # 신규 상장 종목은 다음 전체 갱신 전까지 시세만 표시
+            refreshed.append(build_bulk_result(meta, market, {}))
+
+    refreshed = finalize_market_results(refreshed)
+    meta = save_market_snapshot(market, refreshed, mode='prices')
+    return {'meta': meta, 'stocks': refreshed}
+
+
+def _authorize_refresh() -> bool:
+    if not REFRESH_SECRET:
+        return False
+    token = request.headers.get('X-Refresh-Secret') or request.args.get('secret', '')
+    return token == REFRESH_SECRET
+
+
 # ── 직접 종목 검색 ────────────────────────────────────────────────────────────
 @app.route('/api/search-stock')
 def api_search_stock():
@@ -866,7 +1045,7 @@ def api_search_stock():
     if not query or len(query) < 1:
         return jsonify({'status': 'ok', 'data': []})
 
-    cached = get_cache(f'market_{market}')
+    cached = get_market_stocks(market)
     if cached:
         q = query.upper()
         matched = [s for s in cached if
@@ -890,6 +1069,51 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/status')
+def api_status():
+    markets = {}
+    for market in ('KOSPI', 'KOSDAQ'):
+        meta = get_market_meta(market)
+        markets[market] = meta or {'market': market, 'count': 0}
+    return jsonify({'status': 'ok', 'markets': markets})
+
+
+@app.route('/api/refresh', methods=['GET', 'POST'])
+def api_refresh():
+    """주기 갱신 엔드포인트. GitHub Actions / Render Cron에서 호출한다."""
+    if not _authorize_refresh():
+        return jsonify({
+            'status': 'error',
+            'message': 'REFRESH_SECRET이 없거나 인증에 실패했습니다.',
+        }), 401
+
+    mode = (request.args.get('mode') or (request.get_json(silent=True) or {}).get('mode') or 'full').lower()
+    market = (request.args.get('market') or (request.get_json(silent=True) or {}).get('market') or 'ALL').upper()
+    if mode not in ('full', 'prices'):
+        return jsonify({'status': 'error', 'message': 'mode는 full 또는 prices만 가능합니다.'}), 400
+    if market not in ('KOSPI', 'KOSDAQ', 'ALL'):
+        return jsonify({'status': 'error', 'message': 'market은 KOSPI, KOSDAQ, ALL만 가능합니다.'}), 400
+
+    if not _refresh_lock.acquire(blocking=False):
+        return jsonify({'status': 'error', 'message': '이미 갱신이 진행 중입니다.'}), 409
+
+    try:
+        targets = ['KOSPI', 'KOSDAQ'] if market == 'ALL' else [market]
+        results = {}
+        for target in targets:
+            if mode == 'prices':
+                payload = refresh_market_prices(target)
+            else:
+                payload = analyze_market_full(target)
+            results[target] = payload['meta']
+        return jsonify({'status': 'ok', 'mode': mode, 'results': results})
+    except Exception as exc:
+        logger.warning(f'[갱신 실패] mode={mode} market={market}: {exc}')
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+    finally:
+        _refresh_lock.release()
+
+
 @app.route('/api/cache/clear')
 def api_cache_clear():
     _cache.clear(); _cache_times.clear()
@@ -903,84 +1127,40 @@ def api_market_stream(market: str):
     if market not in ('KOSPI', 'KOSDAQ'):
         return jsonify({'error': '지원하지 않는 시장'}), 400
 
-    cached = get_cache(f'market_{market}')
+    cached = get_market_stocks(market)
 
     def generate():
-        # ── 캐시 적중 ──
+        # ── 저장된 데이터 우선 제공 (주기 갱신 결과) ──
         if cached is not None:
+            meta = get_market_meta(market)
             sector_avgs = calc_sector_averages(cached)
             for i, stock in enumerate(cached):
-                # 캐시된 데이터에 업종 평균 시그널 재생성
                 sec_avg = sector_avgs.get(stock.get('sector', '-'))
-                full = {**stock}
-                stock['signals'] = generate_signals(full, sec_avg)
+                stock['signals'] = generate_signals({**stock}, sec_avg)
                 yield f"data: {json.dumps({'type':'stock','data':stock,'scanned':i+1,'total':len(cached),'cached':True})}\n\n"
-            yield f"data: {json.dumps({'type':'done','total':len(cached),'sector_avgs':sector_avgs,'cached':True})}\n\n"
+            buy  = sum(1 for r in cached if r['scoring']['grade'] == 'BUY')
+            hold = sum(1 for r in cached if r['scoring']['grade'] == 'HOLD')
+            yield f"data: {json.dumps({'type':'done','total':len(cached),'buy':buy,'hold':hold,'sector_avgs':sector_avgs,'cached':True,'updated_at':meta.get('updated_at'),'full_updated_at':meta.get('full_updated_at'),'prices_updated_at':meta.get('prices_updated_at'),'mode':meta.get('mode')})}\n\n"
             return
 
-        # ── 새 스캔 ──
+        # ── 첫 방문: 저장된 데이터가 없을 때만 즉시 전체 분석 ──
         try:
-            listing = get_listing(market)
+            yield f"data: {json.dumps({'type':'progress','scanned':0,'total':0,'message':'저장된 데이터가 없어 전체 분석을 시작합니다'})}\n\n"
+            payload = analyze_market_full(market)
         except Exception as e:
             yield f"data: {json.dumps({'type':'error','message':str(e)})}\n\n"
             return
 
-        total = len(listing)
-        all_results = []
-        is_bulk_listing = bool(listing and listing[0].get('bulk_data') is not None)
+        all_results = payload['stocks']
+        meta = payload['meta']
+        total = len(all_results)
+        for scanned, res in enumerate(all_results, 1):
+            yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
 
-        if is_bulk_listing:
-            # KRX 시세는 전체 시장을 일괄 조회하고 DART도 최대 100개 회사씩 조회한다.
-            # 종목마다 yfinance를 호출하지 않아 전체 시장에서도 요청 제한을 피할 수 있다.
-            yield f"data: {json.dumps({'type':'progress','scanned':0,'total':total,'message':'OpenDART 재무제표 조회 중'})}\n\n"
-            try:
-                dart_data = fetch_dart_financials([item['kr_code'] for item in listing])
-            except Exception as exc:
-                logger.warning(f'[OpenDART 전체 조회 실패] {exc}')
-                yield f"data: {json.dumps({'type':'error','message':f'OpenDART 재무정보 조회 실패: {exc}'})}\n\n"
-                return
-
-            for scanned, meta in enumerate(listing, 1):
-                res = build_bulk_result(meta, market, dart_data)
-                all_results.append(res)
-                yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
-        else:
-            # 전체 목록 조회 장애로 내장 목록을 사용하는 경우에만 기존 단건 조회를 사용한다.
-            result_queue = queue.Queue()
-
-            def worker(meta):
-                result_queue.put(build_result(meta, market))
-
-            executor = ThreadPoolExecutor(max_workers=8)
-            for meta in listing:
-                executor.submit(worker, meta)
-            executor.shutdown(wait=False)
-
-            scanned = 0
-            while scanned < total:
-                try:
-                    res = result_queue.get(timeout=90)
-                    scanned += 1
-                    if res:
-                        all_results.append(res)
-                        yield f"data: {json.dumps({'type':'stock','data':res,'scanned':scanned,'total':total})}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'type':'progress','scanned':scanned,'total':total})}\n\n"
-                except queue.Empty:
-                    break
-
-        # 업종 평균 계산 후 최종 시그널 업데이트
         sector_avgs = calc_sector_averages(all_results)
-        for s in all_results:
-            sec_avg = sector_avgs.get(s.get('sector', '-'))
-            s['signals'] = generate_signals(s, sec_avg)
-
-        all_results.sort(key=lambda x: x['scoring']['total'], reverse=True)
-        set_cache(f'market_{market}', all_results)
-
         buy  = sum(1 for r in all_results if r['scoring']['grade'] == 'BUY')
         hold = sum(1 for r in all_results if r['scoring']['grade'] == 'HOLD')
-        yield f"data: {json.dumps({'type':'done','total':len(all_results),'scanned':scanned,'buy':buy,'hold':hold,'sector_avgs':sector_avgs})}\n\n"
+        yield f"data: {json.dumps({'type':'done','total':len(all_results),'scanned':total,'buy':buy,'hold':hold,'sector_avgs':sector_avgs,'updated_at':meta.get('updated_at'),'full_updated_at':meta.get('full_updated_at'),'prices_updated_at':meta.get('prices_updated_at'),'mode':meta.get('mode')})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -1096,6 +1276,11 @@ def api_stock(ticker: str):
               'scoring': scoring, 'history': history, 'signals': signals}
     set_cache(f'detail_{ticker}', result)
     return jsonify({'status': 'ok', 'data': result})
+
+
+# 서버 시작 시 저장된 시장 스냅샷을 메모리에 올린다.
+for _market in ('KOSPI', 'KOSDAQ'):
+    load_market_snapshot(_market)
 
 
 if __name__ == '__main__':

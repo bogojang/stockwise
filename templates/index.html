@@ -233,6 +233,7 @@
     <div class="bg-slate-800 rounded-full h-1.5 overflow-hidden">
       <div id="progress-bar" class="h-1.5 bg-gradient-to-r from-blue-500 to-purple-500 rounded-full transition-[width] duration-300" style="width:0%"></div>
     </div>
+    <p id="refresh-meta" class="text-[11px] text-slate-600 mt-2"></p>
   </div>
 
   <!-- 컨트롤 바 -->
@@ -305,6 +306,18 @@ const f = (v, d=2, fb='-') => (v == null) ? fb : Number(v).toFixed(d);
 const esc = v => String(v??'').replace(/[&<>"']/g, c=>({
   '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
 }[c]));
+function formatRefreshMeta(msg) {
+  const fmt = iso => {
+    if (!iso) return '-';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString('ko-KR', { hour12:false });
+  };
+  const modeLabel = msg.mode === 'prices' ? '시세 갱신' : '전체 분석';
+  const source = msg.cached ? '저장된 데이터' : '방금 분석';
+  return `마지막 갱신 ${fmt(msg.updated_at)} · ${modeLabel} · ${source}`
+    + (msg.full_updated_at ? ` · 전체분석 ${fmt(msg.full_updated_at)}` : '');
+}
 function fmtMoney(v, cur='KRW') {
   if (!v) return '-';
   const a=Math.abs(v), s=v<0?'-':'';
@@ -472,7 +485,8 @@ function loadMarket(market) {
   document.getElementById('progress-bar').style.width='0%';
 
   document.getElementById('scan-text').textContent=
-    `${market} 전체 종목 불러오는 중... KRX 투자지표 + OpenDART 최근 3개년 재무제표 비교`;
+    `${market} 저장된 분석 불러오는 중... (주기 갱신 데이터 우선)`;
+  document.getElementById('refresh-meta').textContent='';
 
   currentSSE = new EventSource(`/api/market/${market}/stream`);
 
@@ -516,6 +530,7 @@ function loadMarket(market) {
       document.getElementById('progress-bar').style.width='100%';
       document.getElementById('scan-text').textContent=
         `분석 완료 — 총 ${msg.total}개 종목 · 📈매수 ${msg.buy||0}개 · 🔵보유 ${msg.hold||0}개`;
+      document.getElementById('refresh-meta').textContent = formatRefreshMeta(msg);
       document.getElementById('control-bar').classList.remove('hidden');
       renderGrid();
     }
